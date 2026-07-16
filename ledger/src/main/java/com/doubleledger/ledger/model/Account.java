@@ -37,10 +37,6 @@ public class Account {
     @Column(nullable = false)
     private AccountStatus status = AccountStatus.active;
 
-    @Version
-    @Column(nullable = false)
-    private Long version = 0L; // Optimistic locking version for safety
-
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt = OffsetDateTime.now();
 
@@ -104,7 +100,6 @@ public class Account {
     public void setOverdraftLimitMinorUnits(Long overdraftLimitMinorUnits) { this.overdraftLimitMinorUnits = overdraftLimitMinorUnits; }
     public AccountStatus getStatus() { return status; }
     public void setStatus(AccountStatus status) { this.status = status; }
-    public Long getVersion() { return version; }
     public OffsetDateTime getCreatedAt() { return createdAt; }
     public OffsetDateTime getUpdatedAt() { return updatedAt; }
 }

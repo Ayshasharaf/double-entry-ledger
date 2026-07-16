@@ -41,5 +41,6 @@ public class JournalEntry {
     public UUID getReversesJournalEntryId() { return reversesJournalEntryId; }
     public void setReversesJournalEntryId(UUID reversesJournalEntryId) { this.reversesJournalEntryId = reversesJournalEntryId; }
     public OffsetDateTime getPostedAt() { return postedAt; }
+    public void setPostedAt(OffsetDateTime postedAt) { this.postedAt = postedAt; }
     public OffsetDateTime getCreatedAt() { return createdAt; }
 }

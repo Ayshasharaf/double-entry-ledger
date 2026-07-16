@@ -11,17 +11,20 @@ public class TransactionLegDto {
     // The target account ID where the money is moving to or from
     private UUID accountId;
 
-    // The signed value in minor units (e.g., -1000 means -$10.00, +1000 means +$10.00)
-    // We use long to prevent decimal floating point calculation rounding errors.
+    // Unsigned amount in minor units (always positive; direction is explicit).
     private long amountMinorUnits;
+
+    // "DEBIT" or "CREDIT" — relative to the target account's normal balance rules.
+    private String direction;
 
     // --- Empty Constructor ---
     public TransactionLegDto() {}
 
     // --- Parameterized Constructor for testing/convenience ---
-    public TransactionLegDto(UUID accountId, long amountMinorUnits) {
+    public TransactionLegDto(UUID accountId, long amountMinorUnits, String direction) {
         this.accountId = accountId;
         this.amountMinorUnits = amountMinorUnits;
+        this.direction = direction;
     }
 
     // --- Getters & Setters ---
@@ -30,4 +33,7 @@ public class TransactionLegDto {
 
     public long getAmountMinorUnits() { return amountMinorUnits; }
     public void setAmountMinorUnits(long amountMinorUnits) { this.amountMinorUnits = amountMinorUnits; }
+
+    public String getDirection() { return direction; }
+    public void setDirection(String direction) { this.direction = direction; }
 }

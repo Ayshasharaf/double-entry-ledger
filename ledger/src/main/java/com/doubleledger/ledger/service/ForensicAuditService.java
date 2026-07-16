@@ -20,23 +20,22 @@ public class ForensicAuditService {
     }
 
     /**
-     * Completely non-blocking. Writes directly to Standard Out (stdout)
-     * as structured JSON. ZERO database connections are opened.
+     * Logs only unexpected infrastructure or persistence failures — not validation
+     * rejections or idempotency replays, which are normal control-flow paths.
      */
-    public void logFailedTransaction(PostTransactionRequest request, String errorMessage) {
+    public void logUnexpectedFailure(PostTransactionRequest request, Throwable error) {
         try {
             Map<String, Object> logPayload = new HashMap<>();
-            logPayload.put("eventType", "LEDGER_POSTING_FAILED");
+            logPayload.put("eventType", "LEDGER_POSTING_UNEXPECTED_FAILURE");
             logPayload.put("idempotencyKey", request.getIdempotencyKey());
             logPayload.put("description", request.getDescription());
-            logPayload.put("errorMessage", errorMessage);
-            logPayload.put("attemptedPayload", request); // Serialized as a nested JSON object
+            logPayload.put("errorType", error.getClass().getName());
+            logPayload.put("errorMessage", error.getMessage());
+            logPayload.put("attemptedPayload", request);
 
-            // Prints clean, one-line structured JSON to stdout
             log.error(objectMapper.writeValueAsString(logPayload));
 
         } catch (Exception serializationError) {
-            // Ultimate fallback in case JSON serialization fails
             log.error("CRITICAL: Failed to write forensic audit log. Reason: {}, Original Request Idempotency Key: {}",
                     serializationError.getMessage(), request.getIdempotencyKey());
         }

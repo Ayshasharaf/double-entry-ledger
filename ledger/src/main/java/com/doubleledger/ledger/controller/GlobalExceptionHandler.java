@@ -1,5 +1,6 @@
 package com.doubleledger.ledger.controller;
 
+import com.doubleledger.ledger.exception.IdempotencyConflictException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -28,6 +29,16 @@ public class GlobalExceptionHandler {
         body.put("message", errors);
 
         return new ResponseEntity<>(body, HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(IdempotencyConflictException.class)
+    public ResponseEntity<Map<String, Object>> handleIdempotencyConflict(IdempotencyConflictException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", Instant.now().toString());
+        body.put("status", HttpStatus.CONFLICT.value());
+        body.put("error", "Conflict");
+        body.put("message", ex.getMessage());
+        return new ResponseEntity<>(body, HttpStatus.CONFLICT);
     }
 
     @ExceptionHandler(IllegalArgumentException.class)
