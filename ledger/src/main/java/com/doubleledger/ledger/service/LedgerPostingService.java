@@ -135,6 +135,7 @@ public class LedgerPostingService {
         journalEntry.setPostedAt(OffsetDateTime.now());
         journalEntry = journalEntryRepository.save(journalEntry);
 
+        List<LedgerEntry> ledgerEntries = new ArrayList<>(legs.size());
         for (TransactionLegDto leg : legs) {
             Account account = accountMap.get(leg.getAccountId());
             long amount = leg.getAmountMinorUnits();
@@ -145,8 +146,6 @@ public class LedgerPostingService {
                 account.credit(amount);
             }
 
-            accountRepository.save(account);
-
             LedgerEntry ledgerEntry = new LedgerEntry();
             ledgerEntry.setId(UUID.randomUUID());
             ledgerEntry.setJournalEntryId(journalId);
@@ -156,8 +155,14 @@ public class LedgerPostingService {
             ledgerEntry.setAmountMinorUnits(signedAmount);
             ledgerEntry.setBalanceAfter(account.getBalanceMinorUnits());
 
-            ledgerEntryRepository.save(ledgerEntry);
+            ledgerEntries.add(ledgerEntry);
         }
+
+        List<Account> modifiedAccounts = sortedAccountIds.stream()
+                .map(accountMap::get)
+                .toList();
+        accountRepository.saveAll(modifiedAccounts);
+        ledgerEntryRepository.saveAll(ledgerEntries);
 
         return journalEntry;
     }
