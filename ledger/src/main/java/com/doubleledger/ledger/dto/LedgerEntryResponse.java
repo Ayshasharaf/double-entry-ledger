@@ -1,23 +1,25 @@
 package com.doubleledger.ledger.dto;
 
 import com.doubleledger.ledger.model.LedgerEntry;
-import java.math.BigDecimal;
+
 import java.util.UUID;
 
 public record LedgerEntryResponse(
         UUID id,
         UUID accountId,
-        String direction, // "DEBIT" or "CREDIT"
-        BigDecimal amount,
-        String currency
+        String direction,
+        long amountMinorUnits,
+        long balanceAfter
 ) {
     public static LedgerEntryResponse fromEntity(LedgerEntry entry) {
+        long signedAmount = entry.getAmountMinorUnits();
+        String direction = signedAmount < 0 ? "DEBIT" : "CREDIT";
         return new LedgerEntryResponse(
                 entry.getId(),
-                entry.getAccount().getId(),
-                entry.getDirection().name(),
-                entry.getAmount(),
-                entry.getCurrency()
+                entry.getAccountId(),
+                direction,
+                Math.abs(signedAmount),
+                entry.getBalanceAfter()
         );
     }
 }

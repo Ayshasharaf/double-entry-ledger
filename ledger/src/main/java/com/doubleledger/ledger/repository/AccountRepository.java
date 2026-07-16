@@ -15,6 +15,6 @@ import java.util.UUID;
 public interface AccountRepository extends JpaRepository<Account, UUID> {
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @Query("SELECT a FROM Account a WHERE a.id IN :ids")
+    @Query("SELECT a FROM Account a WHERE a.id IN :ids ORDER BY a.id")
     List<Account> findAllByIdsForUpdate(@Param("ids") List<UUID> ids);
 }

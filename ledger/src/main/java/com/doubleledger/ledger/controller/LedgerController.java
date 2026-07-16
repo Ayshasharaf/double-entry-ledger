@@ -6,7 +6,6 @@ import com.doubleledger.ledger.dto.JournalEntryResponse;
 import com.doubleledger.ledger.dto.PostTransactionRequest;
 import com.doubleledger.ledger.model.Account;
 import com.doubleledger.ledger.model.AccountType;
-import com.doubleledger.ledger.model.NormalBalance;
 import com.doubleledger.ledger.model.JournalEntry;
 import com.doubleledger.ledger.repository.AccountRepository;
 import com.doubleledger.ledger.service.LedgerPostingService;
@@ -16,7 +15,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
-import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
@@ -47,39 +45,31 @@ public class LedgerController {
      */
     @PostMapping("/accounts")
     public ResponseEntity<AccountResponse> createAccount(@Valid @RequestBody CreateAccountRequest request) {
-        // 1. Map from CreateAccountRequest DTO to a clean Account entity
         Account account = new Account();
 
-        // Client-side UUID generation support (standard in distributed systems)
         account.setId(request.getId() != null ? request.getId() : UUID.randomUUID());
         account.setName(request.getName());
 
-        // Safely parse String representations of accounting concepts to strict Java Enums
         try {
-            account.setType(AccountType.valueOf(request.getAccountType().toUpperCase()));
-            account.setNormalBalance(NormalBalance.valueOf(request.getNormalBalance().toUpperCase()));
+            account.setAccountType(AccountType.valueOf(request.getAccountType().trim().toLowerCase()));
+            account.setNormalBalance(parseNormalBalance(request.getNormalBalance()));
         } catch (IllegalArgumentException | NullPointerException e) {
             throw new IllegalArgumentException("Invalid account type or normal balance format.");
         }
 
-        // Validate ISO 4217 currency input
         if (request.getCurrency() == null || request.getCurrency().trim().length() != 3) {
             throw new IllegalArgumentException("Currency must be a valid 3-letter ISO code.");
         }
         account.setCurrency(request.getCurrency().toUpperCase());
 
-        // Initialize balances securely at zero - NEVER allow client payloads to override starting balances
-        account.setBalance(BigDecimal.ZERO);
-
-        // Set overdraft parameters
+        account.setBalanceMinorUnits(0L);
         account.setAllowOverdraft(request.isAllowOverdraft());
 
         if (request.isAllowOverdraft() && request.getOverdraftLimitMinorUnits() < 0) {
             throw new IllegalArgumentException("Overdraft limit minor units cannot be negative.");
         }
-        account.setOverdraftLimitCents(request.getOverdraftLimitMinorUnits());
+        account.setOverdraftLimitMinorUnits(request.getOverdraftLimitMinorUnits());
 
-        // 2. Persist the sanitized entity
         Account savedAccount = accountRepository.save(account);
 
         return new ResponseEntity<>(AccountResponse.fromEntity(savedAccount), HttpStatus.CREATED);
@@ -108,5 +98,13 @@ public class LedgerController {
                 .map(AccountResponse::fromEntity)
                 .toList();
         return new ResponseEntity<>(accounts, HttpStatus.OK);
+    }
+
+    private static String parseNormalBalance(String input) {
+        return switch (input.trim().toUpperCase()) {
+            case "D", "DEBIT" -> "D";
+            case "C", "CREDIT" -> "C";
+            default -> throw new IllegalArgumentException("Normal balance must be D, C, DEBIT, or CREDIT.");
+        };
     }
 }
