@@ -67,10 +67,7 @@ public class LedgerPostingService {
             if (existingTx.isPresent()) {
                 return existingTx.get();
             }
-            forensicAuditService.logFailedTransaction(request, ex.getMessage());
-            throw ex;
-        } catch (Exception ex) {
-            forensicAuditService.logFailedTransaction(request, ex.getMessage());
+            forensicAuditService.logUnexpectedFailure(request, ex);
             throw ex;
         }
     }

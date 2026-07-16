@@ -6,9 +6,10 @@ import com.doubleledger.ledger.dto.JournalEntryResponse;
 import com.doubleledger.ledger.dto.PostTransactionRequest;
 import com.doubleledger.ledger.model.Account;
 import com.doubleledger.ledger.model.AccountType;
-import com.doubleledger.ledger.model.JournalEntry;
 import com.doubleledger.ledger.repository.AccountRepository;
+import com.doubleledger.ledger.service.IdempotencyService;
 import com.doubleledger.ledger.service.LedgerPostingService;
+import com.doubleledger.ledger.service.RequestHasher;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -24,19 +25,42 @@ public class LedgerController {
 
     private final LedgerPostingService postingService;
     private final AccountRepository accountRepository;
+    private final IdempotencyService idempotencyService;
+    private final RequestHasher requestHasher;
 
-    public LedgerController(LedgerPostingService postingService, AccountRepository accountRepository) {
+    public LedgerController(LedgerPostingService postingService,
+                            AccountRepository accountRepository,
+                            IdempotencyService idempotencyService,
+                            RequestHasher requestHasher) {
         this.postingService = postingService;
         this.accountRepository = accountRepository;
+        this.idempotencyService = idempotencyService;
+        this.requestHasher = requestHasher;
     }
 
     /**
      * Posts a multi-legged transaction with full idempotency checks.
      */
     @PostMapping("/transactions")
-    public ResponseEntity<JournalEntryResponse> postTransaction(@Valid @RequestBody PostTransactionRequest request) {
-        JournalEntry entry = postingService.postTransaction(request);
-        return new ResponseEntity<>(JournalEntryResponse.fromEntity(entry), HttpStatus.CREATED);
+    public ResponseEntity<JournalEntryResponse> postTransaction(
+            @RequestHeader("Idempotency-Key") String idempotencyKeyHeader,
+            @Valid @RequestBody PostTransactionRequest request) {
+
+        UUID domainKey = resolveDomainIdempotencyKey(idempotencyKeyHeader, request);
+        request.setIdempotencyKey(domainKey);
+
+        String requestHash = requestHasher.hashPostTransaction(request);
+        IdempotencyService.PostTransactionOutcome outcome = idempotencyService.executePostTransaction(
+                idempotencyKeyHeader,
+                requestHash,
+                () -> postingService.postTransaction(request));
+
+        HttpStatus status = outcome.replayed() ? HttpStatus.OK : HttpStatus.CREATED;
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(status);
+        if (outcome.replayed()) {
+            builder.header("Idempotent-Replayed", "true");
+        }
+        return builder.body(outcome.response());
     }
 
     /**
@@ -98,6 +122,29 @@ public class LedgerController {
                 .map(AccountResponse::fromEntity)
                 .toList();
         return new ResponseEntity<>(accounts, HttpStatus.OK);
+    }
+
+    private static UUID resolveDomainIdempotencyKey(String header, PostTransactionRequest request) {
+        if (header == null || header.isBlank()) {
+            throw new IllegalArgumentException("Idempotency-Key header is required.");
+        }
+        if (header.length() > 255) {
+            throw new IllegalArgumentException("Idempotency-Key must be at most 255 characters.");
+        }
+
+        UUID headerKey;
+        try {
+            headerKey = UUID.fromString(header.trim());
+        } catch (IllegalArgumentException ex) {
+            throw new IllegalArgumentException("Idempotency-Key header must be a valid UUID.");
+        }
+
+        if (request.getIdempotencyKey() != null && !request.getIdempotencyKey().equals(headerKey)) {
+            throw new IllegalArgumentException(
+                    "Request body idempotencyKey must match the Idempotency-Key header.");
+        }
+
+        return headerKey;
     }
 
     private static String parseNormalBalance(String input) {
