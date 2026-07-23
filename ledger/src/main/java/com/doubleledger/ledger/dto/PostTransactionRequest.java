@@ -9,9 +9,6 @@ import java.util.UUID;
  */
 public class PostTransactionRequest {
 
-    // The transaction-level ID
-    private UUID id;
-
     // Domain-level idempotency key to prevent processing the same economic event twice
     private UUID idempotencyKey;
 
@@ -28,9 +25,6 @@ public class PostTransactionRequest {
     public PostTransactionRequest() {}
 
     // --- Getters & Setters ---
-    public UUID getId() { return id; }
-    public void setId(UUID id) { this.id = id; }
-
     public UUID getIdempotencyKey() { return idempotencyKey; }
     public void setIdempotencyKey(UUID idempotencyKey) { this.idempotencyKey = idempotencyKey; }
 

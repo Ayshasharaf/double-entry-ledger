@@ -32,8 +32,7 @@ class LedgerPostingConcurrencyIntegrationTest extends PostgresIntegrationTestSup
         Account wallet = createAssetAccount("wallet");
         Account pool = createAssetAccount("pool");
 
-        wallet.setBalanceMinorUnits(THREAD_COUNT * WITHDRAWAL_AMOUNT - 1);
-        accountRepository.save(wallet);
+        fundAccount(wallet, (THREAD_COUNT - 1) * WITHDRAWAL_AMOUNT);
 
         CountDownLatch ready = new CountDownLatch(THREAD_COUNT);
         CountDownLatch start = new CountDownLatch(1);
@@ -76,8 +75,7 @@ class LedgerPostingConcurrencyIntegrationTest extends PostgresIntegrationTestSup
         assertThat(successes.get()).isEqualTo(THREAD_COUNT - 1);
         assertThat(failures.get()).isEqualTo(1);
 
-        Account reloaded = accountRepository.findById(wallet.getId()).orElseThrow();
-        assertThat(reloaded.getBalanceMinorUnits()).isZero();
+        assertThat(balanceOf(wallet)).isZero();
     }
 
     @Test
@@ -85,10 +83,8 @@ class LedgerPostingConcurrencyIntegrationTest extends PostgresIntegrationTestSup
         Account accountA = createAssetAccount("account-a");
         Account accountB = createAssetAccount("account-b");
 
-        accountA.setBalanceMinorUnits(50_000L);
-        accountB.setBalanceMinorUnits(50_000L);
-        accountRepository.save(accountA);
-        accountRepository.save(accountB);
+        fundAccount(accountA, 50_000L);
+        fundAccount(accountB, 50_000L);
 
         int rounds = 20;
         CountDownLatch ready = new CountDownLatch(rounds * 2);

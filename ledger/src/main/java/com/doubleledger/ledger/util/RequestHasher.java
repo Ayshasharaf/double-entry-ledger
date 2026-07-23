@@ -1,4 +1,4 @@
-package com.doubleledger.ledger.service;
+package com.doubleledger.ledger.util;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.UUID;
 
 /**
  * Computes a deterministic SHA-256 fingerprint of an HTTP request for idempotency checks.
@@ -17,6 +18,7 @@ import java.security.NoSuchAlgorithmException;
 public class RequestHasher {
 
     private static final String TRANSACTION_POST_SCOPE = "POST:/api/v1/transactions:";
+    private static final String REVERSAL_POST_SCOPE = "POST:/api/v1/transactions/{id}/reversals:";
 
     private final ObjectMapper canonicalMapper;
 
@@ -29,6 +31,16 @@ public class RequestHasher {
         try {
             String canonicalBody = canonicalMapper.writeValueAsString(requestBody);
             return sha256Hex(TRANSACTION_POST_SCOPE + canonicalBody);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalArgumentException("Unable to hash request body.", ex);
+        }
+    }
+
+    public String hashReverseTransaction(UUID journalEntryId, Object requestBody) {
+        try {
+            String canonicalBody = canonicalMapper.writeValueAsString(
+                    requestBody != null ? requestBody : new Object());
+            return sha256Hex(REVERSAL_POST_SCOPE + journalEntryId + ":" + canonicalBody);
         } catch (JsonProcessingException ex) {
             throw new IllegalArgumentException("Unable to hash request body.", ex);
         }

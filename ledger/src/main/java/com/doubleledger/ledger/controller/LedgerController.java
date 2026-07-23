@@ -4,12 +4,12 @@ import com.doubleledger.ledger.dto.AccountResponse;
 import com.doubleledger.ledger.dto.CreateAccountRequest;
 import com.doubleledger.ledger.dto.JournalEntryResponse;
 import com.doubleledger.ledger.dto.PostTransactionRequest;
-import com.doubleledger.ledger.model.Account;
-import com.doubleledger.ledger.model.AccountType;
-import com.doubleledger.ledger.repository.AccountRepository;
+import com.doubleledger.ledger.dto.ReverseTransactionRequest;
+import com.doubleledger.ledger.service.AccountService;
 import com.doubleledger.ledger.service.IdempotencyService;
+import com.doubleledger.ledger.service.JournalEntryResponseService;
 import com.doubleledger.ledger.service.LedgerPostingService;
-import com.doubleledger.ledger.service.RequestHasher;
+import com.doubleledger.ledger.util.RequestHasher;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -24,23 +24,23 @@ import java.util.UUID;
 public class LedgerController {
 
     private final LedgerPostingService postingService;
-    private final AccountRepository accountRepository;
+    private final AccountService accountService;
     private final IdempotencyService idempotencyService;
     private final RequestHasher requestHasher;
+    private final JournalEntryResponseService journalEntryResponseService;
 
     public LedgerController(LedgerPostingService postingService,
-                            AccountRepository accountRepository,
+                            AccountService accountService,
                             IdempotencyService idempotencyService,
-                            RequestHasher requestHasher) {
+                            RequestHasher requestHasher,
+                            JournalEntryResponseService journalEntryResponseService) {
         this.postingService = postingService;
-        this.accountRepository = accountRepository;
+        this.accountService = accountService;
         this.idempotencyService = idempotencyService;
         this.requestHasher = requestHasher;
+        this.journalEntryResponseService = journalEntryResponseService;
     }
 
-    /**
-     * Posts a multi-legged transaction with full idempotency checks.
-     */
     @PostMapping("/transactions")
     public ResponseEntity<JournalEntryResponse> postTransaction(
             @RequestHeader("Idempotency-Key") String idempotencyKeyHeader,
@@ -50,11 +50,59 @@ public class LedgerController {
         request.setIdempotencyKey(domainKey);
 
         String requestHash = requestHasher.hashPostTransaction(request);
-        IdempotencyService.PostTransactionOutcome outcome = idempotencyService.executePostTransaction(
+        IdempotencyService.IdempotentOperationOutcome outcome = idempotencyService.executePostTransaction(
                 idempotencyKeyHeader,
                 requestHash,
                 () -> postingService.postTransaction(request));
 
+        return idempotentResponse(outcome);
+    }
+
+    @PostMapping("/transactions/{journalEntryId}/reversals")
+    public ResponseEntity<JournalEntryResponse> reverseTransaction(
+            @PathVariable UUID journalEntryId,
+            @RequestHeader("Idempotency-Key") String idempotencyKeyHeader,
+            @RequestBody(required = false) ReverseTransactionRequest request) {
+
+        UUID domainKey = parseIdempotencyKeyHeader(idempotencyKeyHeader);
+        ReverseTransactionRequest body = request != null ? request : new ReverseTransactionRequest();
+        String requestHash = requestHasher.hashReverseTransaction(journalEntryId, body);
+
+        IdempotencyService.IdempotentOperationOutcome outcome = idempotencyService.executeReverseTransaction(
+                idempotencyKeyHeader,
+                requestHash,
+                () -> postingService.reverseTransaction(journalEntryId, domainKey, body));
+
+        return idempotentResponse(outcome);
+    }
+
+    @GetMapping("/transactions/{journalEntryId}")
+    @Transactional(readOnly = true)
+    public ResponseEntity<JournalEntryResponse> getTransaction(@PathVariable UUID journalEntryId) {
+        return journalEntryResponseService.findById(journalEntryId)
+                .map(response -> new ResponseEntity<>(response, HttpStatus.OK))
+                .orElseGet(() -> new ResponseEntity<>(HttpStatus.NOT_FOUND));
+    }
+
+    @PostMapping("/accounts")
+    public ResponseEntity<AccountResponse> createAccount(@Valid @RequestBody CreateAccountRequest request) {
+        return new ResponseEntity<>(accountService.createAccount(request), HttpStatus.CREATED);
+    }
+
+    @GetMapping("/accounts/{id}")
+    public ResponseEntity<AccountResponse> getAccount(@PathVariable UUID id) {
+        return accountService.findById(id)
+                .map(response -> new ResponseEntity<>(response, HttpStatus.OK))
+                .orElseGet(() -> new ResponseEntity<>(HttpStatus.NOT_FOUND));
+    }
+
+    @GetMapping("/accounts")
+    public ResponseEntity<List<AccountResponse>> getAllAccounts() {
+        return new ResponseEntity<>(accountService.findAll(), HttpStatus.OK);
+    }
+
+    private static ResponseEntity<JournalEntryResponse> idempotentResponse(
+            IdempotencyService.IdempotentOperationOutcome outcome) {
         HttpStatus status = outcome.replayed() ? HttpStatus.OK : HttpStatus.CREATED;
         ResponseEntity.BodyBuilder builder = ResponseEntity.status(status);
         if (outcome.replayed()) {
@@ -63,81 +111,8 @@ public class LedgerController {
         return builder.body(outcome.response());
     }
 
-    /**
-     * Provisions a new account in the ledger using the secure CreateAccountRequest DTO.
-     * Prevents Mass Assignment Vulnerabilities.
-     */
-    @PostMapping("/accounts")
-    public ResponseEntity<AccountResponse> createAccount(@Valid @RequestBody CreateAccountRequest request) {
-        Account account = new Account();
-
-        account.setId(request.getId() != null ? request.getId() : UUID.randomUUID());
-        account.setName(request.getName());
-
-        try {
-            account.setAccountType(AccountType.valueOf(request.getAccountType().trim().toLowerCase()));
-            account.setNormalBalance(parseNormalBalance(request.getNormalBalance()));
-        } catch (IllegalArgumentException | NullPointerException e) {
-            throw new IllegalArgumentException("Invalid account type or normal balance format.");
-        }
-
-        if (request.getCurrency() == null || request.getCurrency().trim().length() != 3) {
-            throw new IllegalArgumentException("Currency must be a valid 3-letter ISO code.");
-        }
-        account.setCurrency(request.getCurrency().toUpperCase());
-
-        account.setBalanceMinorUnits(0L);
-        account.setAllowOverdraft(request.isAllowOverdraft());
-
-        if (request.isAllowOverdraft() && request.getOverdraftLimitMinorUnits() < 0) {
-            throw new IllegalArgumentException("Overdraft limit minor units cannot be negative.");
-        }
-        account.setOverdraftLimitMinorUnits(request.getOverdraftLimitMinorUnits());
-
-        Account savedAccount = accountRepository.save(account);
-
-        return new ResponseEntity<>(AccountResponse.fromEntity(savedAccount), HttpStatus.CREATED);
-    }
-
-    /**
-     * Retrieves account balance securely and read-only.
-     */
-    @GetMapping("/accounts/{id}")
-    @Transactional(readOnly = true)
-    public ResponseEntity<AccountResponse> getAccount(@PathVariable UUID id) {
-        return accountRepository.findById(id)
-                .map(AccountResponse::fromEntity)
-                .map(dto -> new ResponseEntity<>(dto, HttpStatus.OK))
-                .orElseGet(() -> new ResponseEntity<>(HttpStatus.NOT_FOUND));
-    }
-
-    /**
-     * Highly optimized batch retrieval of accounts.
-     */
-    @GetMapping("/accounts")
-    @Transactional(readOnly = true)
-    public ResponseEntity<List<AccountResponse>> getAllAccounts() {
-        List<AccountResponse> accounts = accountRepository.findAll()
-                .stream()
-                .map(AccountResponse::fromEntity)
-                .toList();
-        return new ResponseEntity<>(accounts, HttpStatus.OK);
-    }
-
     private static UUID resolveDomainIdempotencyKey(String header, PostTransactionRequest request) {
-        if (header == null || header.isBlank()) {
-            throw new IllegalArgumentException("Idempotency-Key header is required.");
-        }
-        if (header.length() > 255) {
-            throw new IllegalArgumentException("Idempotency-Key must be at most 255 characters.");
-        }
-
-        UUID headerKey;
-        try {
-            headerKey = UUID.fromString(header.trim());
-        } catch (IllegalArgumentException ex) {
-            throw new IllegalArgumentException("Idempotency-Key header must be a valid UUID.");
-        }
+        UUID headerKey = parseIdempotencyKeyHeader(header);
 
         if (request.getIdempotencyKey() != null && !request.getIdempotencyKey().equals(headerKey)) {
             throw new IllegalArgumentException(
@@ -147,11 +122,18 @@ public class LedgerController {
         return headerKey;
     }
 
-    private static String parseNormalBalance(String input) {
-        return switch (input.trim().toUpperCase()) {
-            case "D", "DEBIT" -> "D";
-            case "C", "CREDIT" -> "C";
-            default -> throw new IllegalArgumentException("Normal balance must be D, C, DEBIT, or CREDIT.");
-        };
+    private static UUID parseIdempotencyKeyHeader(String header) {
+        if (header == null || header.isBlank()) {
+            throw new IllegalArgumentException("Idempotency-Key header is required.");
+        }
+        if (header.length() > 255) {
+            throw new IllegalArgumentException("Idempotency-Key must be at most 255 characters.");
+        }
+
+        try {
+            return UUID.fromString(header.trim());
+        } catch (IllegalArgumentException ex) {
+            throw new IllegalArgumentException("Idempotency-Key header must be a valid UUID.");
+        }
     }
 }

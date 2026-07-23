@@ -1,6 +1,8 @@
 package com.doubleledger.ledger.controller;
 
 import com.doubleledger.ledger.exception.IdempotencyConflictException;
+import com.doubleledger.ledger.exception.JournalEntryNotFoundException;
+import com.doubleledger.ledger.exception.TransactionAlreadyReversedException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -33,6 +35,27 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(IdempotencyConflictException.class)
     public ResponseEntity<Map<String, Object>> handleIdempotencyConflict(IdempotencyConflictException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", Instant.now().toString());
+        body.put("status", HttpStatus.CONFLICT.value());
+        body.put("error", "Conflict");
+        body.put("message", ex.getMessage());
+        return new ResponseEntity<>(body, HttpStatus.CONFLICT);
+    }
+
+    @ExceptionHandler(JournalEntryNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleJournalEntryNotFound(JournalEntryNotFoundException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", Instant.now().toString());
+        body.put("status", HttpStatus.NOT_FOUND.value());
+        body.put("error", "Not Found");
+        body.put("message", ex.getMessage());
+        return new ResponseEntity<>(body, HttpStatus.NOT_FOUND);
+    }
+
+    @ExceptionHandler(TransactionAlreadyReversedException.class)
+    public ResponseEntity<Map<String, Object>> handleTransactionAlreadyReversed(
+            TransactionAlreadyReversedException ex) {
         Map<String, Object> body = new HashMap<>();
         body.put("timestamp", Instant.now().toString());
         body.put("status", HttpStatus.CONFLICT.value());

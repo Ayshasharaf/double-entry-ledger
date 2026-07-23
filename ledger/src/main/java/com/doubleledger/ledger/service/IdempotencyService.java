@@ -4,11 +4,10 @@ import com.doubleledger.ledger.dto.JournalEntryResponse;
 import com.doubleledger.ledger.exception.IdempotencyConflictException;
 import com.doubleledger.ledger.model.IdempotencyKey;
 import com.doubleledger.ledger.model.JournalEntry;
+import com.doubleledger.ledger.persistence.PostgresAdvisoryLockService;
 import com.doubleledger.ledger.repository.IdempotencyKeyRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceContext;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -20,27 +19,40 @@ import java.util.function.Supplier;
 @Service
 public class IdempotencyService {
 
-    public record PostTransactionOutcome(JournalEntryResponse response, boolean replayed) {}
+    public record IdempotentOperationOutcome(JournalEntryResponse response, boolean replayed) {}
 
     private final IdempotencyKeyRepository idempotencyKeyRepository;
+    private final JournalEntryResponseService journalEntryResponseService;
     private final ObjectMapper objectMapper;
-
-    @PersistenceContext
-    private EntityManager entityManager;
+    private final PostgresAdvisoryLockService advisoryLockService;
 
     public IdempotencyService(IdempotencyKeyRepository idempotencyKeyRepository,
-                              ObjectMapper objectMapper) {
+                              JournalEntryResponseService journalEntryResponseService,
+                              ObjectMapper objectMapper,
+                              PostgresAdvisoryLockService advisoryLockService) {
         this.idempotencyKeyRepository = idempotencyKeyRepository;
+        this.journalEntryResponseService = journalEntryResponseService;
         this.objectMapper = objectMapper;
+        this.advisoryLockService = advisoryLockService;
     }
 
-    /**
-     * API-layer idempotency: replay cached responses or execute once and persist the result.
-     */
     @Transactional
-    public PostTransactionOutcome executePostTransaction(String apiIdempotencyKey,
+    public IdempotentOperationOutcome executePostTransaction(String apiIdempotencyKey,
+                                                               String requestHash,
+                                                               Supplier<JournalEntry> postingAction) {
+        return executeIdempotent(apiIdempotencyKey, requestHash, postingAction);
+    }
+
+    @Transactional
+    public IdempotentOperationOutcome executeReverseTransaction(String apiIdempotencyKey,
+                                                                String requestHash,
+                                                                Supplier<JournalEntry> reversalAction) {
+        return executeIdempotent(apiIdempotencyKey, requestHash, reversalAction);
+    }
+
+    private IdempotentOperationOutcome executeIdempotent(String apiIdempotencyKey,
                                                          String requestHash,
-                                                         Supplier<JournalEntry> postingAction) {
+                                                         Supplier<JournalEntry> action) {
         acquireAdvisoryLock(apiIdempotencyKey);
 
         Optional<IdempotencyKey> cached = idempotencyKeyRepository.findById(apiIdempotencyKey);
@@ -48,8 +60,8 @@ public class IdempotencyService {
             return replayCached(cached.get(), requestHash);
         }
 
-        JournalEntry entry = postingAction.get();
-        JournalEntryResponse response = JournalEntryResponse.fromEntity(entry);
+        JournalEntry entry = action.get();
+        JournalEntryResponse response = journalEntryResponseService.toResponse(entry);
 
         try {
             persistCache(apiIdempotencyKey, requestHash, HttpStatus.CREATED.value(), response);
@@ -61,10 +73,10 @@ public class IdempotencyService {
             throw ex;
         }
 
-        return new PostTransactionOutcome(response, false);
+        return new IdempotentOperationOutcome(response, false);
     }
 
-    private PostTransactionOutcome replayCached(IdempotencyKey cached, String requestHash) {
+    private IdempotentOperationOutcome replayCached(IdempotencyKey cached, String requestHash) {
         if (!cached.getRequestHash().equals(requestHash)) {
             throw new IdempotencyConflictException(
                     "Idempotency key was already used with a different request body.");
@@ -73,7 +85,7 @@ public class IdempotencyService {
         try {
             JournalEntryResponse response = objectMapper.readValue(
                     cached.getResponseBody(), JournalEntryResponse.class);
-            return new PostTransactionOutcome(response, true);
+            return new IdempotentOperationOutcome(response, true);
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Cached idempotency response is corrupt.", ex);
         }
@@ -98,8 +110,6 @@ public class IdempotencyService {
     }
 
     private void acquireAdvisoryLock(String idempotencyKey) {
-        entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(hashtext(:key))")
-                .setParameter("key", "api-idempotency:" + idempotencyKey)
-                .getSingleResult();
+        advisoryLockService.acquireTransactionLock("api-idempotency:" + idempotencyKey);
     }
 }

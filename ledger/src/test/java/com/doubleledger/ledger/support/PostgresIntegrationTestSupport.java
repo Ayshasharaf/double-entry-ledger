@@ -5,6 +5,8 @@ import com.doubleledger.ledger.dto.TransactionLegDto;
 import com.doubleledger.ledger.model.Account;
 import com.doubleledger.ledger.model.AccountType;
 import com.doubleledger.ledger.repository.AccountRepository;
+import com.doubleledger.ledger.service.AccountBalanceService;
+import com.doubleledger.ledger.service.LedgerPostingService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -28,6 +30,12 @@ public abstract class PostgresIntegrationTestSupport {
 
     @Autowired
     protected AccountRepository accountRepository;
+
+    @Autowired
+    protected LedgerPostingService postingService;
+
+    @Autowired
+    protected AccountBalanceService accountBalanceService;
 
     @DynamicPropertySource
     static void registerDataSource(DynamicPropertyRegistry registry) {
@@ -61,10 +69,43 @@ public abstract class PostgresIntegrationTestSupport {
         account.setAccountType(AccountType.asset);
         account.setNormalBalance("D");
         account.setCurrency("USD");
-        account.setBalanceMinorUnits(0L);
         account.setAllowOverdraft(false);
         account.setOverdraftLimitMinorUnits(0L);
         return accountRepository.save(account);
+    }
+
+    protected Account createEquityAccount(String name) {
+        Account account = new Account();
+        account.setId(UUID.randomUUID());
+        account.setName(name);
+        account.setAccountType(AccountType.equity);
+        account.setNormalBalance("C");
+        account.setCurrency("USD");
+        account.setAllowOverdraft(false);
+        account.setOverdraftLimitMinorUnits(0L);
+        return accountRepository.save(account);
+    }
+
+    protected void fundAccount(Account account, long amountMinorUnits) {
+        Account equity = createEquityAccount("opening-equity-" + account.getName() + "-" + UUID.randomUUID());
+        postingService.postTransaction(buildOpeningBalance(account.getId(), equity.getId(), amountMinorUnits));
+    }
+
+    protected long balanceOf(Account account) {
+        return accountBalanceService.computeBalance(account);
+    }
+
+    protected PostTransactionRequest buildOpeningBalance(UUID fundedAccountId,
+                                                       UUID equityAccountId,
+                                                       long amountMinorUnits) {
+        PostTransactionRequest request = new PostTransactionRequest();
+        request.setIdempotencyKey(UUID.randomUUID());
+        request.setDescription("opening balance");
+        request.setLegs(List.of(
+                new TransactionLegDto(fundedAccountId, amountMinorUnits, "DEBIT"),
+                new TransactionLegDto(equityAccountId, amountMinorUnits, "CREDIT")
+        ));
+        return request;
     }
 
     protected PostTransactionRequest buildTransfer(UUID fromAccountId,

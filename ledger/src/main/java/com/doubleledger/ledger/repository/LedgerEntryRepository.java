@@ -6,12 +6,23 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
-import java.util.Optional;
+import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 @Repository
 public interface LedgerEntryRepository extends JpaRepository<LedgerEntry, UUID> {
 
-    @Query(value = "SELECT * FROM ledger_entries WHERE account_id = :accountId ORDER BY created_at DESC LIMIT 1", nativeQuery = true)
-    Optional<LedgerEntry> findLatestEntryForAccount(@Param("accountId") UUID accountId);
+    List<LedgerEntry> findByJournalEntryIdOrderByCreatedAtAsc(UUID journalEntryId);
+
+    @Query("SELECT COALESCE(SUM(le.amountMinorUnits), 0) FROM LedgerEntry le WHERE le.accountId = :accountId")
+    long sumSignedAmountMinorUnitsByAccountId(@Param("accountId") UUID accountId);
+
+    @Query("""
+            SELECT le.accountId, COALESCE(SUM(le.amountMinorUnits), 0)
+            FROM LedgerEntry le
+            WHERE le.accountId IN :accountIds
+            GROUP BY le.accountId
+            """)
+    List<Object[]> sumSignedAmountMinorUnitsByAccountIds(@Param("accountIds") Collection<UUID> accountIds);
 }

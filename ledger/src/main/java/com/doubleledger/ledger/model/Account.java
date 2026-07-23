@@ -24,9 +24,6 @@ public class Account {
     @Column(nullable = false, length = 3)
     private String currency;
 
-    @Column(name = "balance_minor_units", nullable = false)
-    private Long balanceMinorUnits = 0L;
-
     @Column(name = "allow_overdraft", nullable = false)
     private Boolean allowOverdraft = false;
 
@@ -43,36 +40,11 @@ public class Account {
     @Column(name = "updated_at", nullable = false)
     private OffsetDateTime updatedAt = OffsetDateTime.now();
 
-    // --- Helper Methods ---
-
-    public void debit(long amount) {
-        if (amount < 0) throw new IllegalArgumentException("Debit amount must be positive");
-
-        if (accountType == AccountType.asset || accountType == AccountType.expense) {
-            this.balanceMinorUnits += amount;
-        } else {
-            this.balanceMinorUnits -= amount;
-        }
-        validateOverdraft();
-    }
-
-    public void credit(long amount) {
-        if (amount < 0) throw new IllegalArgumentException("Credit amount must be positive");
-
-        if (accountType == AccountType.liability || accountType == AccountType.equity || accountType == AccountType.revenue) {
-            this.balanceMinorUnits += amount;
-        } else {
-            this.balanceMinorUnits -= amount;
-        }
-        validateOverdraft();
-    }
-
-    private void validateOverdraft() {
+    public void validateBalance(long balanceMinorUnits) {
         if (status == AccountStatus.frozen) {
             throw new IllegalStateException("Cannot transact on a frozen account");
         }
 
-        // Assets are normally positive (Debits). If it falls below 0, check overdraft rules.
         if (balanceMinorUnits < 0 && !allowOverdraft) {
             throw new IllegalArgumentException("Overdraft not allowed on account: " + id);
         }
@@ -81,7 +53,6 @@ public class Account {
         }
     }
 
-    // --- Getters & Setters ---
     public UUID getId() { return id; }
     public void setId(UUID id) { this.id = id; }
     public String getName() { return name; }
@@ -92,8 +63,6 @@ public class Account {
     public void setNormalBalance(String normalBalance) { this.normalBalance = normalBalance; }
     public String getCurrency() { return currency; }
     public void setCurrency(String currency) { this.currency = currency; }
-    public Long getBalanceMinorUnits() { return balanceMinorUnits; }
-    public void setBalanceMinorUnits(Long balanceMinorUnits) { this.balanceMinorUnits = balanceMinorUnits; }
     public Boolean getAllowOverdraft() { return allowOverdraft; }
     public void setAllowOverdraft(Boolean allowOverdraft) { this.allowOverdraft = allowOverdraft; }
     public Long getOverdraftLimitMinorUnits() { return overdraftLimitMinorUnits; }

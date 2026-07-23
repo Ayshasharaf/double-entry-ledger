@@ -48,8 +48,7 @@ class IdempotencyIntegrationTest extends PostgresIntegrationTestSupport {
     void setUpAccounts() {
         wallet = createAssetAccount("idempotency-wallet");
         pool = createAssetAccount("idempotency-pool");
-        wallet.setBalanceMinorUnits(1_000_000L);
-        accountRepository.save(wallet);
+        fundAccount(wallet, 1_000_000L);
     }
 
     @Test

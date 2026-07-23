@@ -1,330 +1,570 @@
-# ledger-core — Design Document
+# DoubleLedger — ledger-core
 
-A portfolio project to learn and demonstrate the core primitives behind
-fintech backends: double-entry accounting, ACID transactions, concurrency
-control, and idempotency. Built in Java 21 + Spring Boot + PostgreSQL.
+A **double-entry financial ledger** built with **Java 21**, **Spring Boot 4**, and **PostgreSQL**.
 
----
+Money never appears or disappears — it only moves. Every transaction is recorded as balanced legs (debits = credits), stored atomically, and protected against duplicate requests and concurrent race conditions.
 
-## 1. What This Project Is, and Why
-
-### What is a double-entry ledger?
-
-A double-entry ledger is a bookkeeping system built around one rule:
-**money never appears or disappears — it only moves.** Every financial
-event is recorded as two or more balanced entries: value leaving one
-account is always matched, exactly, by value arriving in another. If the
-entries for a transaction don't sum to zero, the transaction is invalid
-by definition — not a business error, a structural one.
-
-This is the model used underneath real payment systems — Stripe, Wise,
-Adyen, and every retail bank — as the **single source of truth** for
-balances. It doesn't talk to card networks or banking rails directly; it
-sits behind the business logic layer and records the internal movement
-of money that those systems trigger.
-
-```
-Payment Gateway / API  →  Business Application Layer  →  ledger-core (this service)
-```
-
-### Why I'm building this
-
-I'm a CS grad targeting backend/fintech roles, and a ledger is a good
-vehicle for that because it forces you to actually use — not just know
-about — the things these companies interview on:
-
-- ACID transaction boundaries
-- Row-level locking and race conditions under concurrent writes
-- Idempotency (safe retries over an unreliable network)
-- Exact-precision arithmetic (no floats near money)
-- Designing a schema whose *constraints*, not just its application code,
-  prevent corruption
-
-This is **Block 1** of a larger system. Later blocks — an outbox/event
-layer, webhook delivery, a fraud/rules engine — will consume events from
-this ledger, so Block 1 is scoped to have clean boundaries even though
-none of that is built yet.
-
-### Core concepts I'm learning from it
-
-- **The double-entry invariant** — why "debit" and "credit" are relative
-  to account type, not fixed meanings of "money in/out."
-- **Denormalized vs. derived state** — caching a running balance for
-  read speed, and what that costs you in write-side complexity (locking).
-- **Pessimistic concurrency control** — `SELECT ... FOR UPDATE` and why
-  it's the simpler, more defensible choice here over optimistic
-  versioning or retry loops.
-- **Defense in depth** — enforcing the same invariant at both the
-  application layer (fast, friendly errors) and the database layer
-  (the actual backstop that can't be bypassed by a bug or a stray
-  `psql` session).
-- **Idempotency at two different layers** — API-response caching vs.
-  domain-event deduplication, and why those are two separate problems.
-- **Immutability as an audit strategy** — corrections are new entries,
-  never edits or deletes.
+This is **Block 1** of a larger system. Later blocks (event outbox, webhooks, fraud rules) will consume ledger events — this service is scoped to be the single source of truth for balances.
 
 ---
 
-## 2. Learning From How Others Build This
+## Table of contents
 
-Before finalizing the schema, I looked at how three different classes of
-systems solve the same problem, to understand which parts of my design
-are "the standard shape" versus decisions I'm actually making myself.
-
-**TigerBeetle** — a purpose-built financial database (written in Zig,
-using the LMAX Disruptor pattern) that does nothing but ledger
-operations, at very high throughput. It models a `Transfer` as movement
-between exactly two accounts, and multi-leg transactions are composed
-from several *linked* transfers rather than one wide record. It also
-expresses "which side increases this account" as account-level flags
-rather than a stored label.
-*What I took from it:* the idea of validating a debit/credit rule
-structurally rather than trusting application code, and using flexible
-`user_data` fields to link back to external entities without the ledger
-needing to understand them.
-
-**Formance Ledger** — an open-source, Postgres-backed, event-sourced
-ledger that uses a DSL (Numscript) to declare transactions as a set of
-postings, where each posting is asset-aware. A single transaction can
-fan out across many accounts and assets in one atomic operation.
-*What I took from it:* the "one transaction, many legs" shape (header +
-line items), which is more natural for fee-splitting or multi-party
-payouts than TigerBeetle's two-account transfer model — this is the
-shape I chose.
-
-**Medici** (Node.js double-entry library) — organizes itself the same
-way: a journal has child transactions/legs, and won't write anything
-unless the legs net to zero. It also handles corrections by "voiding" —
-posting an equal-and-opposite entry rather than touching history.
-*What I took from it:* the reversal pattern (`reverses_journal_entry_id`)
-instead of deletion or mutation.
-
-**Stripe-style implementations** (various engineering write-ups on
-building Stripe-like ledgers in Laravel/Rails) — consistently reinforced
-three things regardless of language: store money as integers, treat a
-transaction as atomic-or-nothing, and never delete — reverse.
-
-Net result: my schema follows the **Formance/Medici shape** (one
-`journal_entries` header + N `ledger_entries` legs) rather than
-TigerBeetle's two-account-per-transfer shape, specifically because it
-makes a payment that splits into a merchant payout + platform fee + tax
-a single journal entry instead of several linked records.
+1. [Quick start](#quick-start)
+2. [Is the app "complete"?](#is-the-app-complete)
+3. [Architecture overview](#architecture-overview)
+4. [Code map](#code-map)
+5. [Data flow — start to finish](#data-flow--start-to-finish)
+6. [Database design](#database-design)
+7. [Rules & principles](#rules--principles)
+8. [Testing](#testing)
+9. [Docker — what it does here](#docker--what-it-does-here)
+10. [API examples](#api-examples)
+11. [Limitations (v1)](#limitations-v1)
+12. [What's next](#whats-next)
 
 ---
 
-## 3. How I'm Building It (Phases)
+## Quick start
 
-I'm going step by step and not skipping ahead, so each layer is
-understood before the next one depends on it:
+### Prerequisites
 
-```
-Phase 1 — Schema & Docker         Postgres + Flyway migrations, no app code yet
-Phase 2 — Core domain models      Java entities, zero-sum validation logic
-Phase 3 — Idempotency layer       Key validation + cached responses
-Phase 4 — Concurrency testing     Multi-threaded tests, prove the locking works
-Phase 5 — API layer               Controllers, DTOs, endpoints
-Phase 6 — Docs & CI               README, DESIGN.md, GitHub Actions
+
+| Requirement    | Why                                                                            |
+| -------------- | ------------------------------------------------------------------------------ |
+| **Java 21+**   | Project target (`pom.xml`). Java 26 works too.                                 |
+| **Maven**      | Included via `./mvnw` wrapper — no separate install needed.                    |
+| **PostgreSQL** | Required to run the app locally.                                               |
+| **Docker**     | Required for integration tests (Testcontainers). Optional for running the app. |
+
+
+**Set Java (if your default is 17):**
+
+```bash
+# Option A — Java 26 (already on your machine)
+export JAVA_HOME="/opt/homebrew/Cellar/openjdk/26.0.1/libexec/openjdk.jdk/Contents/Home"
+
+# Option B — install Java 21
+brew install openjdk@21
+export JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home"
 ```
 
-**Where I am right now:** Phase 1 is done (migration below) and Phase 2
-is in progress — the JPA entities exist (`Account`, `JournalEntry`,
-`LedgerEntry`, `IdempotencyKey`, `FailedEntry`, plus the `AccountType` /
-`AccountStatus` enums), but there's no repository, service, or
-controller code yet, and no tests. See §6 for exactly what's built vs.
-pending.
+### Run the app
+
+1. Start PostgreSQL with a database matching `application.properties`:
+  ```
+   Host:     localhost:5433
+   Database: ledger_db
+   User:     ledger_admin
+   Password: ledger1234
+  ```
+2. Start Spring Boot:
+  ```bash
+   cd ledger
+   ./mvnw spring-boot:run
+  ```
+   Flyway runs migrations automatically on startup. The app listens on **port 8080** by default.
+
+### Run tests
+
+```bash
+# All tests
+./mvnw clean test
+
+# Integration tests only (6 tests)
+./mvnw clean test -Dtest="*IntegrationTest*,LedgerApplicationTests"
+
+# One test class
+./mvnw test -Dtest=IdempotencyIntegrationTest
+
+# One test method
+./mvnw test -Dtest=IdempotencyIntegrationTest#sequentialReplay_returns200WithReplayHeader
+```
+
+**Expected result when healthy:**
+
+```
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
 
 ---
 
-## 4. Terminology — Demystifying the Accounting Language
+## Is the app "complete"?
 
-The schema borrows vocabulary from real accounting, which is worth
-translating up front:
+For **Block 1 (core ledger)**, the app is working when all of these are true:
 
-| Term | Plain-English meaning |
-|---|---|
-| **Asset** | What the business/user owns (cash, balances). |
-| **Liability** | What the business owes to someone else. A user's balance is technically a liability *to the bank* — money owed to the user on demand. |
-| **Equity** | Net worth: assets minus liabilities. |
-| **Revenue / Expense** | Money earned from operating the business / money spent running it. |
-| **Debit (D) / Credit (C)** | Not "money out/in." These are just **left/right**, positional labels. What they *do* to a balance depends on account type. |
-| **Normal balance** | Which side (D or C) *increases* a given account type. Assets & expenses increase on debit; liabilities, equity & revenue increase on credit. |
-| **Trial balance** | The audit check that total debits equal total credits system-wide. My `check_journal_entry_balances()` trigger is a real-time version of this, scoped to one transaction. |
-| **Running balance (`balance_after`)** | A snapshot of the account's balance immediately after one specific entry — lets you answer "what was the balance on date X" without replaying all history. |
 
-The practical payoff of the D/C convention: because every account type
-has a fixed normal balance, a debit and a credit of the same amount on
-two different account types can be represented as a single **signed
-integer** (negative for debit, positive for credit). That collapses the
-zero-sum check into `SUM(amount) = 0` instead of branching enum logic.
+| Check                    | How to verify                                                       |
+| ------------------------ | ------------------------------------------------------------------- |
+| Spring context starts    | `LedgerApplicationTests.contextLoads` passes                        |
+| Database schema is valid | Flyway migration `V1__initial_ledger_schema.sql` runs without error |
+| Posting works            | Integration tests pass (balance updates, zero-sum enforced)         |
+| Idempotency works        | 50 concurrent retries → 1 create + 49 replays                       |
+| Concurrency is safe      | 10 parallel withdrawals → exactly 1 rejection, no deadlock          |
+| API is reachable         | `POST /api/v1/accounts` and `POST /api/v1/transactions` return 201  |
+
+
+**What is NOT done yet** (see [What's next](#whats-next)): transaction reversals, unit tests, Docker Compose for local dev, CI pipeline, event outbox.
 
 ---
 
-## 5. The Schema — What, Why, and Where the Idea Came From
+## Architecture overview
 
-The schema splits every financial event into a **header** and its
-**legs**, which is the standard shape described in §2, not something
-specific to this project.
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         HTTP Client                              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │  POST /api/v1/transactions
+                             │  Header: Idempotency-Key
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  controller/                                                     │
+│  LedgerController          GlobalExceptionHandler                │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+┌──────────────────┐ ┌─────────────┐ ┌──────────────────┐
+│ IdempotencyService│ │RequestHasher│ │LedgerPostingService│
+│ (API-layer cache) │ │ (SHA-256)   │ │ (core engine)     │
+└────────┬─────────┘ └─────────────┘ └────────┬─────────┘
+         │                                     │
+         └──────────────┬──────────────────────┘
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  repository/          JPA + Hibernate                            │
+│  AccountRepository · JournalEntryRepository · LedgerEntryRepository│
+│  IdempotencyKeyRepository                                         │
+└────────────────────────────┬────────────────────────────────────┘
+                             │  SELECT ... FOR UPDATE (row locks)
+                             │  pg_advisory_xact_lock (idempotency)
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  PostgreSQL                                                      │
+│  Flyway migrations · constraint triggers · ACID transactions     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### `accounts`
+### Layer responsibilities
 
-| Column | Why it exists |
-|---|---|
-| `account_type` | Lets the system eventually produce a trial balance / balance sheet, and stops the app from crediting a revenue account by mistake. |
-| `normal_balance` | Explicit statement of which side increases the account. TigerBeetle achieves the same concept structurally, via account flags instead of a stored label — either is valid, the concept just has to live *somewhere*. |
-| `balance_minor_units` | A cached, denormalized balance — chosen over summing `ledger_entries` on every read for performance. The tradeoff: every posting has to lock and update this row, which is your throughput ceiling on "hot" accounts. This exact bottleneck is the problem TigerBeetle was purpose-built to solve at scale. |
-| `currency` | ISO 4217. Each account holds exactly one currency — multi-currency movement goes through explicit legs and clearing accounts, not a mixed-currency balance. |
-| `allow_overdraft` / `overdraft_limit_minor_units` | Business-rule fields, not accounting-model fields. |
-| `status` | Lets an account be frozen or closed without deleting its history. |
 
-**Dropped from the original draft:** an optimistic-locking `version`
-column running *alongside* `SELECT ... FOR UPDATE`. Running both
-pessimistic and optimistic concurrency control at once doesn't add
-safety — it adds a second failure mode to reason about. I picked
-pessimistic locking as the single mechanism (see §1 and Postgres docs on
-[`SELECT ... FOR UPDATE`](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)).
+| Layer                    | Responsibility                                              |
+| ------------------------ | ----------------------------------------------------------- |
+| **Controller**           | HTTP in/out, validation, idempotency header parsing         |
+| **IdempotencyService**   | API-layer dedup — replay cached HTTP responses on retry     |
+| **LedgerPostingService** | Domain logic — lock accounts, apply legs, update balances   |
+| **Account (entity)**     | Debit/credit rules per account type, overdraft checks       |
+| **Repository**           | Database access with pessimistic write locks                |
+| **PostgreSQL**           | Final backstop — zero-sum trigger, unique constraints, ACID |
 
-### `journal_entries` (the header)
-
-| Column | Why it exists |
-|---|---|
-| `idempotency_key` | **Domain-level** dedup — don't post the same business event twice, no matter which code path it arrived through. Distinct from the separate `idempotency_keys` table below (API-layer dedup). |
-| `status` + `reverses_journal_entry_id` | Corrections are handled the way Medici "voids" a journal: post an equal-and-opposite entry against the original, rather than editing or deleting it. |
-| `metadata` (JSONB) | Arbitrary external references (order IDs, payment intents) — the same role TigerBeetle's `user_data` fields play, so the ledger can link outward without needing to understand the thing it's linking to. |
-
-### `ledger_entries` (the legs) and the zero-sum invariant
-
-Each row is one signed leg against one account, plus `balance_after` —
-the running balance right after that leg. The actual "double-entry"
-guarantee is enforced by a `DEFERRABLE INITIALLY DEFERRED` constraint
-trigger (`check_journal_entry_balances()`) that checks, **at commit
-time**, that all legs belonging to one journal entry are in a single
-currency and sum to exactly zero. It's deferred because legs are
-inserted one row at a time within the same transaction — checking after
-each row would fail on the first insert.
-
-This is deliberately scoped to **single-currency journal entries** for
-v1. A cross-currency transaction isn't silently allowed with mismatched
-amounts; it has to be expressed as matched same-currency legs on each
-side through an explicit FX/clearing account — which mirrors how
-Formance (asset-aware postings) and TigerBeetle (ledger-scoped accounts,
-chained same-ledger transfers) both handle it.
-
-### `idempotency_keys` vs. `journal_entries.idempotency_key`
-
-These look redundant but guard different failure points:
-
-- `idempotency_keys` — **API layer.** Any endpoint. If a client retries
-  an HTTP call after a dropped response, this replays the exact same
-  response instead of re-executing anything.
-- `journal_entries.idempotency_key` — **domain layer.** Guarantees one
-  business event (e.g. "charge order #123") is posted once, even if it
-  somehow reaches the ledger through two different code paths.
-
-### `failed_entries` (the forensic log)
-
-When a submission fails a business-rule check (not a DB error — a
-rejection, like breaking the zero-sum invariant or an overdraft limit),
-most simple systems just return an error and the attempt is gone. This
-table keeps the raw payload and the reason it failed, because in
-finance, "someone attempted this and here's exactly why it didn't go
-through" matters to auditors and support — silence doesn't.
 
 ---
 
-## 6. The Model Layer — What I Built and Why
-
-The schema above is relational; Java speaks in objects. JPA/Hibernate is
-the translator between the two — annotating a class tells Hibernate how
-to map it onto a table, row by row, column by column (e.g. `UUID id` ↔
-`id UUID PRIMARY KEY`, `Long balanceMinorUnits` ↔ `BIGINT`, so money
-never touches a floating-point type end to end).
-
-What exists so far, one entity per table:
-
-- **`Account`** — mirrors the `accounts` table, and also owns the
-  `debit()` / `credit()` helper methods plus `validateOverdraft()`. This
-  is deliberate: the *type-dependent* meaning of debit/credit (does it
-  increase or decrease this account?) is domain logic, not persistence
-  logic, so it lives on the entity rather than scattered through a
-  service class.
-- **`JournalEntry`** — the header row: idempotency key, description,
-  status, and the reversal pointer.
-- **`LedgerEntry`** — one leg: signed `amountMinorUnits`, plus
-  `balanceAfter` as a point-in-time snapshot.
-- **`IdempotencyKey`** — the API-layer response cache row.
-- **`FailedEntry`** — the forensic log row (JSONB payload currently
-  mapped as a plain `String`; a proper JSON type converter is still
-  pending).
-- **`AccountType`** / **`AccountStatus`** — enums backing the checked
-  columns, mapped with `@Enumerated(EnumType.STRING)` so the database
-  stores readable text (`'asset'`, `'frozen'`) instead of ordinals.
-
-**Why validate in both Java *and* SQL, when they check the same thing?**
-This is intentional defense in depth: the Java-side checks
-(`validateOverdraft()`, and eventually the zero-sum check before insert)
-give fast, user-facing error messages without wasting a database
-round-trip. The SQL-side constraint trigger is the actual backstop —
-even a bug in the Java layer, or someone hitting the database directly,
-cannot leave the ledger unbalanced, because the database itself refuses
-to commit a broken transaction.
-
----
-
-## 7. Current Status & What's Left
-
-**Repo layout right now:**
+## Code map
 
 ```
 ledger/
-├── src/main/java/.../ledger/
-│   ├── LedgerApplication.java
-│   ├── controller/        (empty — not started)
-│   ├── dto/                (empty — not started)
-│   ├── model/               ✅ done
-│   │   ├── Account.java
-│   │   ├── AccountStatus.java
-│   │   ├── AccountType.java
-│   │   ├── FailedEntry.java
-│   │   ├── IdempotencyKey.java
-│   │   ├── JournalEntry.java
-│   │   └── LedgerEntry.java
-│   ├── repository/         (empty — not started)
-│   └── service/             (empty — not started)
-└── src/main/resources/db/migration/
-    └── V1__initial_ledger_schema.sql   ✅ done
+├── src/main/java/com/doubleledger/ledger/
+│   ├── LedgerApplication.java          ← Spring Boot entry point
+│   │
+│   ├── controller/
+│   │   ├── LedgerController.java       ← REST API (/accounts, /transactions)
+│   │   └── GlobalExceptionHandler.java ← 400 / 409 / 500 error responses
+│   │
+│   ├── dto/                            ← Request/response shapes (no business logic)
+│   │   ├── CreateAccountRequest.java
+│   │   ├── PostTransactionRequest.java
+│   │   ├── TransactionLegDto.java
+│   │   └── *Response.java
+│   │
+│   ├── service/
+│   │   ├── LedgerPostingService.java   ← Core posting engine
+│   │   ├── IdempotencyService.java     ← API idempotency cache
+│   │   ├── RequestHasher.java          ← SHA-256 fingerprint of request body
+│   │   └── ForensicAuditService.java   ← Structured error logging
+│   │
+│   ├── repository/                     ← Spring Data JPA interfaces
+│   │   ├── AccountRepository.java      ← includes findAllByIdsForUpdate()
+│   │   ├── JournalEntryRepository.java
+│   │   ├── LedgerEntryRepository.java
+│   │   └── IdempotencyKeyRepository.java
+│   │
+│   ├── model/                          ← JPA entities ↔ database tables
+│   │   ├── Account.java                ← debit(), credit(), validateOverdraft()
+│   │   ├── JournalEntry.java           ← transaction header
+│   │   ├── LedgerEntry.java            ← one leg (signed amount)
+│   │   └── IdempotencyKey.java         ← cached API response
+│   │
+│   └── config/
+│       └── AsyncConfig.java
+│
+├── src/main/resources/
+│   ├── application.properties          ← DB connection, Flyway, logging
+│   └── db/migration/
+│       └── V1__initial_ledger_schema.sql
+│
+└── src/test/java/com/doubleledger/ledger/
+    ├── support/
+    │   └── PostgresIntegrationTestSupport.java  ← Testcontainers + helpers
+    ├── LedgerApplicationTests.java              ← smoke test
+    ├── IdempotencyIntegrationTest.java          ← HTTP idempotency (3 tests)
+    └── LedgerPostingConcurrencyIntegrationTest.java ← locking (2 tests)
 ```
 
-**Done:**
-- [x] Schema + Flyway migration (`V1__initial_ledger_schema.sql`)
-- [x] JPA entity mappings for all five tables
-- [x] `AccountType` / `AccountStatus` enums
-- [x] Overdraft + debit/credit logic on `Account`
+---
 
-**Not started yet — space reserved for the rest of the build:**
-- [ ] **Repositories** — Spring Data JPA interfaces, including the
-  pessimistic write lock (`@Lock(LockModeType.PESSIMISTIC_WRITE)`)
-  on account lookups.
-- [ ] **Service layer** — transaction posting orchestration: open a DB
-  transaction, lock accounts, apply legs, validate zero-sum,
-  commit or roll back.
-- [ ] **Idempotency interceptor** — reads the `Idempotency-Key` header,
-  checks `idempotency_keys`, replays or rejects on hash mismatch.
-- [ ] **DTOs + Controllers** — the REST surface (`POST /accounts`,
-  `POST /transactions`, `POST /transactions/{id}/reversals`, etc.)
-- [ ] **Unit tests** — unbalanced-transaction rejection, overdraft
-  rules, idempotency replay vs. conflict.
-- [ ] **Integration tests (Testcontainers)** — real Postgres, full
-  posting flow, rollback behavior.
-- [ ] **Concurrency test** — the centerpiece: N simultaneous
-  withdrawals against a balance that can only cover one; prove a
-  naive version fails, then prove the locked version passes.
-- [ ] **Docker Compose + CI** — one-command local run; GitHub Actions
-  for lint/unit/integration/concurrency on every push.
-- [ ] **README + this doc's remaining sections** — API contract with
-  curl examples, and the open design questions from the original
-  brief (isolation level choice, idempotency key retention policy)
-  still need to be answered and written up here.
+## Data flow — start to finish
 
-This document will keep growing as each phase lands — the next section
-to fill in is the concurrency design (§8, not yet written), once the
-repository/service layer exists to test against.
+### Example: transfer $5.00 from Wallet → Pool
+
+**Request:**
+
+```http
+POST /api/v1/transactions
+Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+{
+  "description": "transfer to pool",
+  "legs": [
+    { "accountId": "<wallet-uuid>", "amountMinorUnits": 500, "direction": "CREDIT" },
+    { "accountId": "<pool-uuid>",   "amountMinorUnits": 500, "direction": "DEBIT"  }
+  ]
+}
+```
+
+> Amounts are in **minor units** (cents). 500 = $5.00. No floats anywhere.
+
+### Step-by-step flow
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Controller as LedgerController
+    participant Hasher as RequestHasher
+    participant Idem as IdempotencyService
+    participant Post as LedgerPostingService
+    participant DB as PostgreSQL
+
+    Client->>Controller: POST /transactions + Idempotency-Key
+    Controller->>Hasher: hash request body (SHA-256)
+    Controller->>Idem: executePostTransaction(key, hash, postingAction)
+
+    Idem->>DB: pg_advisory_xact_lock (API key)
+    Idem->>DB: lookup idempotency_keys
+
+    alt Key exists + same hash
+        Idem-->>Controller: cached response (200 OK, Idempotent-Replayed: true)
+    else Key exists + different hash
+        Idem-->>Controller: 409 Conflict
+    else New request
+        Idem->>Post: postTransaction(request)
+        Post->>DB: pg_advisory_xact_lock (domain key)
+        Post->>Post: validate legs sum to zero
+        Post->>DB: SELECT accounts FOR UPDATE (sorted by id)
+        Post->>Post: debit/credit each account
+        Post->>DB: INSERT journal_entry + ledger_entries
+        Post->>DB: UPDATE account balances
+        DB->>DB: deferred trigger checks SUM(amount) = 0
+        Post-->>Idem: JournalEntry
+        Idem->>DB: INSERT idempotency_keys (cache response)
+        Idem-->>Controller: new response (201 Created)
+    end
+
+    Controller-->>Client: JSON JournalEntryResponse
+```
+
+
+
+### What gets written to the database
+
+For one $5.00 transfer, three rows change:
+
+```
+journal_entries          ledger_entries                    accounts
+─────────────────        ─────────────────────────────     ────────────────
+id: je-001               leg 1: wallet  amount = +500      wallet: 9500 → 9000
+idempotency_key: ...     leg 2: pool    amount = -500      pool:   0    → 500
+description: "transfer"  balance_after on each leg
+status: posted
+```
+
+Signed amounts: **negative = debit**, **positive = credit**. They must sum to **zero** per journal entry (enforced by a deferred DB trigger at commit time).
+
+---
+
+## Database design
+
+```mermaid
+erDiagram
+    accounts ||--o{ ledger_entries : "has legs"
+    journal_entries ||--|{ ledger_entries : "contains"
+    journal_entries {
+        uuid id PK
+        uuid idempotency_key UK
+        string status
+        uuid reverses_journal_entry_id FK
+    }
+    ledger_entries {
+        uuid id PK
+        uuid journal_entry_id FK
+        uuid account_id FK
+        bigint amount_minor_units
+        bigint balance_after
+    }
+    accounts {
+        uuid id PK
+        string account_type
+        string currency
+        bigint balance_minor_units
+        boolean allow_overdraft
+    }
+    idempotency_keys {
+        text idempotency_key PK
+        text request_hash
+        int response_status
+        text response_body
+    }
+```
+
+
+
+### Two idempotency layers (not redundant)
+
+
+| Layer      | Table                             | Purpose                                                                  |
+| ---------- | --------------------------------- | ------------------------------------------------------------------------ |
+| **API**    | `idempotency_keys`                | Client retried HTTP call → replay exact same JSON response               |
+| **Domain** | `journal_entries.idempotency_key` | Same business event can't be posted twice, even via different code paths |
+
+
+Both use **Postgres advisory locks** (`pg_advisory_xact_lock`) to serialize concurrent requests with the same key.
+
+---
+
+## Rules & principles
+
+### Accounting rules
+
+1. **Double-entry invariant** — every journal entry's legs sum to zero (debits = credits).
+2. **No floats** — all money stored as `BIGINT` minor units (cents).
+3. **Single currency per transaction** — multi-currency requires explicit FX/clearing accounts (v2).
+4. **Immutability** — entries are never edited or deleted; corrections will be reversals (not yet implemented).
+
+### Concurrency rules
+
+1. **Pessimistic locking** — accounts are locked with `SELECT ... FOR UPDATE` before balance changes.
+2. **Sorted lock order** — account IDs are locked in sorted order to prevent deadlocks.
+3. **Advisory locks** — idempotency keys are serialized at both API and domain layers.
+
+### Defense in depth
+
+
+| Check                     | Where                                | What happens on failure                |
+| ------------------------- | ------------------------------------ | -------------------------------------- |
+| Legs balance to zero      | Java (`LedgerPostingService`)        | `400 Bad Request` before DB write      |
+| Legs balance to zero      | PostgreSQL trigger                   | Transaction rolled back — can't commit |
+| Overdraft                 | Java (`Account.validateOverdraft()`) | `400 Bad Request`                      |
+| Duplicate idempotency key | Java + DB unique constraint          | Replay or `409 Conflict`               |
+| Same key, different body  | Java (`IdempotencyService`)          | `409 Conflict`                         |
+
+
+### API rules
+
+- Every `POST /transactions` requires an `Idempotency-Key` header (UUID).
+- Request body `idempotencyKey` must match the header if present.
+- First successful post → `201 Created`. Exact retry → `200 OK` + `Idempotent-Replayed: true`.
+
+---
+
+## Testing
+
+### Philosophy
+
+Integration tests boot the **real Spring application** against a **real PostgreSQL** database. No mocks for the database — this proves Flyway migrations, JPA mappings, locking, and triggers all work together.
+
+### Tools
+
+
+| Tool                 | Role                                                 |
+| -------------------- | ---------------------------------------------------- |
+| **JUnit 5**          | Test framework (`@Test`, `@BeforeEach`)              |
+| **Spring Boot Test** | `@SpringBootTest` — loads full application context   |
+| **Testcontainers**   | Spins up `postgres:16-alpine` in Docker during tests |
+| **AssertJ**          | Readable assertions (`assertThat(x).isEqualTo(y)`)   |
+| **RestTestClient**   | HTTP tests without manually starting a server        |
+| **Flyway**           | Same migrations run in tests as in production        |
+| **Maven Surefire**   | Runs tests via `./mvnw test`                         |
+
+
+### Test suite (6 tests)
+
+
+| Test                                                          | Layer   | What it proves                                       |
+| ------------------------------------------------------------- | ------- | ---------------------------------------------------- |
+| `contextLoads`                                                | Smoke   | Spring Boot + Postgres + Flyway all wire up          |
+| `sameIdempotencyKey_concurrentPosts_createSingleJournalEntry` | HTTP    | 50 threads, 1 create + 49 replays                    |
+| `sameIdempotencyKey_differentPayload_returns409`              | HTTP    | Same key + different amount → conflict               |
+| `sequentialReplay_returns200WithReplayHeader`                 | HTTP    | Retry returns cached response                        |
+| `concurrentWithdrawals_exhaustBalanceExactlyOneFails`         | Service | 10 threads, balance for 9 → 1 rejection, balance = 0 |
+| `crossAccountTransfers_doNotDeadlock`                         | Service | 40 bidirectional A↔B transfers, no deadlock          |
+
+
+### How tests get a database
+
+```
+PostgresIntegrationTestSupport (base class for all integration tests)
+        │
+        ├── Docker available?
+        │     YES → Testcontainers starts postgres:16-alpine
+        │           @DynamicPropertySource wires JDBC URL/username/password
+        │
+        └── NO  → Falls back to localhost:5433
+                  (or force with -Dtest.useLocalPostgres=true)
+```
+
+Every test class extends `PostgresIntegrationTestSupport`, which provides:
+
+- Automatic Postgres setup
+- `createAssetAccount(name)` helper
+- `buildTransfer(from, to, amount, idempotencyKey)` helper
+
+---
+
+## Docker — what it does here
+
+**Docker is used for testing, not for running the app (yet).**
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  ./mvnw test                                              │
+│       │                                                   │
+│       ▼                                                   │
+│  Testcontainers ──► Docker ──► postgres:16-alpine         │
+│       │                      (ephemeral, destroyed after) │
+│       ▼                                                   │
+│  Spring Boot test context connects to that Postgres       │
+│  Flyway runs V1 migration                                 │
+│  Tests run against real schema + real locks + real triggers│
+└──────────────────────────────────────────────────────────┘
+```
+
+
+| Scenario                                | Docker needed?                                                   |
+| --------------------------------------- | ---------------------------------------------------------------- |
+| Run integration tests                   | **Yes** — Testcontainers requires Docker running                 |
+| Run the app locally (`spring-boot:run`) | **No** — uses Postgres at `localhost:5433`                       |
+| Run tests without Docker                | Use `-Dtest.useLocalPostgres=true` + local Postgres on port 5433 |
+
+
+**Make sure Docker Desktop is running before `./mvnw test`.**
+
+---
+
+## API examples
+
+### Create an account
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "wallet",
+    "accountType": "asset",
+    "normalBalance": "D",
+    "currency": "USD",
+    "allowOverdraft": false,
+    "overdraftLimitMinorUnits": 0
+  }' | jq
+```
+
+### Post a transaction
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/transactions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -d '{
+    "description": "transfer to pool",
+    "legs": [
+      { "accountId": "<wallet-uuid>", "amountMinorUnits": 500, "direction": "CREDIT" },
+      { "accountId": "<pool-uuid>",   "amountMinorUnits": 500, "direction": "DEBIT"  }
+    ]
+  }' | jq
+```
+
+### Get account balance
+
+```bash
+curl -s http://localhost:8080/api/v1/accounts/<account-uuid> | jq
+```
+
+### Retry (idempotent replay)
+
+Send the exact same request again with the same `Idempotency-Key`:
+
+```
+HTTP/1.1 200 OK
+Idempotent-Replayed: true
+```
+
+---
+
+## Limitations (v1)
+
+
+| Limitation                          | Detail                                                                                 |
+| ----------------------------------- | -------------------------------------------------------------------------------------- |
+| **No transaction reversals**        | Schema supports `reverses_journal_entry_id` but no API endpoint yet                    |
+| **Single currency per transaction** | Cross-currency FX not supported                                                        |
+| **Denormalized balance**            | `accounts.balance_minor_units` is cached — hot accounts become a throughput bottleneck |
+| **No unit tests**                   | Only integration tests exist today                                                     |
+| **No Docker Compose**               | App + Postgres not bundled for one-command local dev                                   |
+| **No CI pipeline**                  | Tests not automated on push yet                                                        |
+| **No authentication**               | API is open — no auth layer                                                            |
+| **No event outbox**                 | Downstream systems can't subscribe to ledger events yet                                |
+| **Idempotency keys never expire**   | No TTL/cleanup policy                                                                  |
+| **failed_entries table**            | Designed in schema docs but not implemented in code                                    |
+
+
+---
+
+## What's next
+
+Recommended order for Block 1 completion and Block 2 start:
+
+```
+Phase A — Finish Block 1
+  ├── Unit tests (validation, overdraft, zero-sum rejection)
+  ├── POST /transactions/{id}/reversals endpoint
+  ├── Docker Compose (app + Postgres, one command)
+  └── GitHub Actions CI (run tests on every push)
+
+Phase B — Block 2 (event layer)
+  ├── Transactional outbox table
+  ├── Publish journal_entry.posted events
+  └── Webhook delivery service
+```
+
+---
+
+## Tech stack
+
+
+| Component        | Version / choice                            |
+| ---------------- | ------------------------------------------- |
+| Java             | 21                                          |
+| Spring Boot      | 4.1.0                                       |
+| PostgreSQL       | 16 (Testcontainers)                         |
+| Flyway           | Schema migrations                           |
+| JPA / Hibernate  | ORM                                         |
+| Testcontainers   | Integration test database                   |
+| Jackson 2        | JSON serialization (`spring-boot-jackson2`) |
+| Logstash encoder | Structured ECS logging                      |
+
+
+---
+
+## Further reading
+
+The original deep-dive design notes (TigerBeetle vs Formance comparisons, schema rationale, terminology) lived in earlier versions of this file. The schema migration at `src/main/resources/db/migration/V1__initial_ledger_schema.sql` is the authoritative source for database constraints and triggers.
